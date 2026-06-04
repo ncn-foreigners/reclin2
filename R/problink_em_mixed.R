@@ -286,9 +286,20 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
   }
 
   # ----- Run EM from one or more starts; keep best log-likelihood -----
-  run_one <- function(start)
-    .run_em_mixed(X, by = by, field_types = field_types, N = N, start = start,
-                  tol = tol, maxits = maxits, lambda_smooth = lambda_smooth)
+  if (all(field_types == "continuous")) {
+    run_one <- function(start) {
+      fit <- .run_em_gammaK(
+        X, K = K, N = N, start = .mixed_start_to_gamma(start, by = by),
+        tol = tol, maxits = maxits, MIN_EFF_N = 3,
+        lambda_smooth = lambda_smooth
+      )
+      .gamma_fit_to_mixed_result(fit, by = by)
+    }
+  } else {
+    run_one <- function(start)
+      .run_em_mixed(X, by = by, field_types = field_types, N = N, start = start,
+                    tol = tol, maxits = maxits, lambda_smooth = lambda_smooth)
+  }
 
   best <- run_one(base_start)
 
@@ -577,6 +588,38 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
   list(lambda = lambda, fields = fields)
 }
 
+#' Convert an all-continuous mixed start to the gamma EM start format
+#' @noRd
+.mixed_start_to_gamma <- function(start, by) {
+  K <- length(by)
+  p0 <- alpha <- beta <- matrix(NA_real_, nrow = 2L, ncol = K)
+  for (k in seq_len(K)) {
+    f <- start$fields[[k]]
+    p0[, k]    <- f$p0
+    alpha[, k] <- f$alpha
+    beta[, k]  <- f$beta
+  }
+  list(lambda = start$lambda, p0 = p0, alpha = alpha, beta = beta)
+}
+
+#' Convert a gamma EM fit to the mixed EM result format
+#' @noRd
+.gamma_fit_to_mixed_result <- function(fit, by) {
+  K <- length(by)
+  fields <- vector("list", K)
+  names(fields) <- by
+  for (k in seq_len(K)) {
+    fields[[k]] <- list(
+      type = "continuous",
+      p0 = fit$p0[, k],
+      alpha = fit$shape[, k],
+      beta = fit$scale[, k]
+    )
+  }
+  list(lambda = fit$lambda, fields = fields, iter = fit$iter,
+       converged = fit$converged, loglik = fit$loglik)
+}
+
 #' Per-field log-density of one component (length-N), NA -> 0 (neutral)
 #'
 #' Returns log f_j(gamma_k) for component j of field k. NA comparison values get
@@ -620,7 +663,23 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
   # initial values (for smoothing shrinkage targets)
   fields0 <- fields
 
+  field_info <- lapply(seq_len(K), function(k) {
+    x <- X[, k]
+    obs <- which(!is.na(x))
+    f <- fields[[k]]
+    if (f$type == "binary") {
+      list(obs = obs, agree = x[obs] == 1)
+    } else if (f$type == "categorical") {
+      list(obs = obs, code = match(x[obs], f$levels))
+    } else {
+      pos <- which(x > 0)
+      list(obs = obs, zero = which(x == 0), pos = pos,
+           xpos = x[pos], logxpos = log(x[pos]))
+    }
+  })
+
   TINY <- 1e-300
+  LOG_DENS_FLOOR <- log(TINY)
   loglam <- log(pmax(lambda, TINY))
 
   # ---- log-density bookkeeping: logL[, j] = sum_k log f_j(gamma_k) ----
@@ -628,8 +687,43 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
     LL <- matrix(0, nrow = N, ncol = 2L)
     for (k in seq_len(K)) {
       f <- fields[[k]]
-      LL[, 1L] <- LL[, 1L] + .logdens_field(X[, k], f, 1L)
-      LL[, 2L] <- LL[, 2L] + .logdens_field(X[, k], f, 2L)
+      info <- field_info[[k]]
+      if (f$type == "binary") {
+        if (length(info$obs)) {
+          for (j in 1:2) {
+            ld <- ifelse(info$agree, log(f$m[j]), log1p(-f$m[j]))
+            ld[!is.finite(ld)] <- LOG_DENS_FLOOR
+            LL[info$obs, j] <- LL[info$obs, j] + ld
+          }
+        }
+      } else if (f$type == "categorical") {
+        if (length(info$obs)) {
+          valid <- !is.na(info$code)
+          for (j in 1:2) {
+            pr <- if (j == 1L) f$m else f$u
+            ld <- rep(LOG_DENS_FLOOR, length(info$obs))
+            if (any(valid)) ld[valid] <- log(pr[info$code[valid]])
+            ld[!is.finite(ld)] <- LOG_DENS_FLOOR
+            LL[info$obs, j] <- LL[info$obs, j] + ld
+          }
+        }
+      } else {
+        for (j in 1:2) {
+          ld <- numeric(N)
+          if (length(info$zero)) {
+            ld[info$zero] <- log(pmax(f$p0[j], TINY))
+          }
+          if (length(info$pos)) {
+            lp <- log1p(-f$p0[j]) +
+              dgamma(info$xpos, shape = f$alpha[j], scale = f$beta[j],
+                     log = TRUE)
+            lp <- pmax(lp, LOG_DENS_FLOOR)
+            lp[!is.finite(lp)] <- LOG_DENS_FLOOR
+            ld[info$pos] <- lp
+          }
+          LL[, j] <- LL[, j] + ld
+        }
+      }
     }
     LL
   }
@@ -693,15 +787,16 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
     for (k in seq_len(K)) {
       f <- fields[[k]]
       f0 <- fields0[[k]]
-      x  <- X[, k]
-      obs <- !is.na(x)
-      qk  <- q[obs]; oneqk <- 1 - qk; xk <- x[obs]
+      info <- field_info[[k]]
+      obs <- info$obs
+      qk  <- q[obs]
+      oneqk <- 1 - qk
       sqk  <- sum(qk); s1qk <- sum(oneqk)
 
       # A field with NO observed rows (entirely NA) carries no information: skip
       # its update so the initial block stays unchanged (no NaN from 0/0). Warn
       # at most once per field for this EM run.
-      if (sum(obs) == 0L) {
+      if (length(obs) == 0L) {
         if (!warned_empty[k]) {
           warning("field '", by[k], "' has no observed (non-NA) comparison ",
                   "values; its parameters are left at their initial values.",
@@ -720,7 +815,7 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
         # f0$m is the length-2 initial agreement-prob vector. Floor each
         # denominator away from zero (a component can have zero weight on the
         # observed rows even when the field itself is observed) so no 0/0 occurs.
-        agree <- as.numeric(xk == 1)
+        agree <- as.numeric(info$agree)
         m11 <- (sum(qk * agree)   + lambda_smooth * f0$m[1]) /
                max(sqk            + lambda_smooth, TINY)
         u11 <- (sum(oneqk * agree) + lambda_smooth * f0$m[2]) /
@@ -730,16 +825,15 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
 
       } else if (f$type == "categorical") {
         lev <- f$levels; L <- length(lev)
-        idx <- match(xk, lev)
+        idx <- info$code
         valid <- !is.na(idx)
         # weighted counts per level for match (q) and non-match (1-q)
         wm <- numeric(L); wu <- numeric(L)
         if (any(valid)) {
-          wm <- as.numeric(tapply(qk[valid],   factor(idx[valid], levels = seq_len(L)),
-                                  sum, default = 0))
-          wu <- as.numeric(tapply(oneqk[valid], factor(idx[valid], levels = seq_len(L)),
-                                  sum, default = 0))
-          wm[is.na(wm)] <- 0; wu[is.na(wu)] <- 0
+          wm_tab <- rowsum(qk[valid], idx[valid], reorder = FALSE)
+          wu_tab <- rowsum(oneqk[valid], idx[valid], reorder = FALSE)
+          wm[as.integer(rownames(wm_tab))] <- wm_tab[, 1]
+          wu[as.integer(rownames(wu_tab))] <- wu_tab[, 1]
         }
         # Multinomial MLE: weighted relative frequency per level (this already
         # sums to 1). Optional smoothing is a proper symmetric-Dirichlet
@@ -760,34 +854,40 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
         f$u <- .multinom_clamp(u_s, ref = which.min(lev), N = N)
 
       } else { # continuous: identical update to problink_em_gamma
-        ind0 <- which(xk == 0)
-        ind1 <- which(xk > 0)
-        z <- cbind(qk, oneqk)
+        ind0 <- info$zero
+        ind1 <- info$pos
         # p0 per component
-        p0_num <- colSums(z[ind0, , drop = FALSE])
-        p0_den <- pmax(colSums(z), 1/N)
+        p0_num <- c(sum(q[ind0]), sum(1 - q[ind0]))
+        p0_den <- pmax(c(sum(q[obs]), sum(1 - q[obs])), 1/N)
         f$p0 <- clamp01_(p0_num / p0_den, lo = 1/N)
         if (length(ind1) >= 2) {
-          eff_n <- colSums(z[ind1, , drop = FALSE])
+          eff_n <- c(sum(q[ind1]), sum(1 - q[ind1]))
           new_alpha <- f$alpha; new_beta <- f$beta
           for (i in 1:2) {
             if (eff_n[i] >= MIN_EFF_N) {
-              zi <- z[ind1, i]; xi <- xk[ind1]
+              zi <- if (i == 1L) q[ind1] else 1 - q[ind1]
+              xi <- info$xpos
+              logxi <- info$logxpos
+              sw <- max(eff_n[i], TINY)
+              sx <- sum(zi * xi)
+              slogx <- sum(zi * logxi)
+              old_beta_i <- f$beta[i]
+              fn_alpha_i <- function(alpha)
+                -log(old_beta_i) + slogx / sw - digamma(alpha)
+              fn_alpha2_i <- function(alpha) fn_alpha_i(alpha)^2
               ns <- tryCatch(
-                uniroot(fn_alpha, interval = c(1e-6, 1e4),
-                        beta = f$beta[i], z = zi, x = xi)$root,
+                uniroot(fn_alpha_i, interval = c(1e-6, 1e4))$root,
                 error = function(e) tryCatch(
-                  nlminb(f$alpha[i], fn_alpha2, lower = 1e-8,
-                         beta = f$beta[i], z = zi, x = xi)$par,
+                  nlminb(f$alpha[i], fn_alpha2_i, lower = 1e-8)$par,
                   error = function(e2) NA_real_))
               if (!is.finite(ns) || ns <= 0) {
-                sw <- max(sum(zi), TINY); mu <- sum(zi * xi) / sw
+                mu <- sx / sw
                 v  <- sum(zi * (xi - mu)^2) / sw
                 ns <- if (is.finite(mu) && is.finite(v) && v > 0) mu^2 / v
                       else f$alpha[i]
               }
               if (!is.finite(ns) || ns <= 0) ns <- f$alpha[i]
-              nb <- fn_beta(zi, xi, ns)
+              nb <- sx / (sw * max(ns, TINY))
               if (!is.finite(nb) || nb <= 0) nb <- f$beta[i]
               new_alpha[i] <- ns; new_beta[i] <- nb
             }

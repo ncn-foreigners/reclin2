@@ -21,6 +21,15 @@ NEW FEATURES
     argument that shrinks the estimated probabilities towards their starting
     values, which is useful when a field has very few exact matches.
 
+IMPROVEMENTS
+
+  - The EM loops in `problink_em()`, `problink_em_gamma()` and
+    `problink_em_mixed()` have been optimized in R by caching comparison-field
+    indices and sufficient statistics, reducing repeated allocation and
+    per-iteration indexing. A new benchmark script
+    `tools/benchmarks/benchmark_phase1_problink_em.R` compares the optimized
+    code against the base version.
+
 
 CHANGES IN VERSION 0.5.1
 
@@ -134,4 +143,3 @@ BUG FIXES:
 
   - `pairs_minsim` did not generate pairs when one of the keys contained 
     missing values.
-
