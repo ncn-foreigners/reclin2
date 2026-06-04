@@ -591,9 +591,22 @@ clamp01_ <- function(p, lo = 1e-6) {
   # is itself a valid probability. With lambda_smooth = 0 this is never read.
   p0_start <- p0_mle
 
+  field_info <- lapply(seq_len(K), function(k) {
+    xk <- X[, k]
+    ind1 <- which(xk > 0)
+    list(
+      obs = which(!is.na(xk)),
+      zero = which(xk == 0),
+      pos = ind1,
+      xpos = xk[ind1],
+      logxpos = log(xk[ind1])
+    )
+  })
+
   # All denominators floored at TINY so a near-collapsed component cannot yield
   # NaN/Inf from a 0-weight division.
   TINY <- 1e-300
+  LOG_DENS_FLOOR <- log(TINY)
   fn_alpha <- function(alpha, beta, z, x)
     -log(beta) + sum(z * log(x)) / max(sum(z), TINY) - digamma(alpha)
   fn_alpha2 <- function(alpha, beta, z, x)
@@ -610,9 +623,21 @@ clamp01_ <- function(p, lo = 1e-6) {
   .logL_mat <- function(p0, alpha, beta) {
     LL <- matrix(0, nrow = N, ncol = ncomp)
     for (k in seq_len(K)) {
+      info <- field_info[[k]]
       for (j in seq_len(ncomp)) {
-        LL[, j] <- LL[, j] + .log_dhgamma(X[, k], p0[j, k], alpha[j, k],
-                                          beta[j, k])
+        ld <- numeric(N)
+        if (length(info$zero)) {
+          ld[info$zero] <- log(pmax(p0[j, k], TINY))
+        }
+        if (length(info$pos)) {
+          lp <- log1p(-p0[j, k]) +
+            dgamma(info$xpos, shape = alpha[j, k], scale = beta[j, k],
+                   log = TRUE)
+          lp <- pmax(lp, LOG_DENS_FLOOR)
+          lp[!is.finite(lp)] <- LOG_DENS_FLOOR
+          ld[info$pos] <- lp
+        }
+        LL[, j] <- LL[, j] + ld
       }
     }
     LL
@@ -655,9 +680,10 @@ clamp01_ <- function(p, lo = 1e-6) {
 
     # ----- M-step -----
     for (k in seq_len(K)) {
-      ind0  <- which(X[, k] == 0)   # exact-zero, observed (NA excluded by ==)
-      ind1  <- which(X[, k] > 0)    # positive,    observed (NA excluded by >)
-      obs_k <- which(!is.na(X[, k]))
+      info <- field_info[[k]]
+      ind0  <- info$zero   # exact-zero, observed (NA excluded by ==)
+      ind1  <- info$pos    # positive,    observed (NA excluded by >)
+      obs_k <- info$obs
 
       # Update p0 for each component. The hurdle probability is P(g = 0 | g
       # observed), so BOTH numerator and denominator must range over rows
@@ -692,30 +718,35 @@ clamp01_ <- function(p, lo = 1e-6) {
         for (i in seq_len(ncomp)) {
           if (eff_n[i] >= MIN_EFF_N) {
             zi <- z[ind1, i]
-            xi <- X[ind1, k]
+            xi <- info$xpos
+            logxi <- info$logxpos
+            sw <- max(eff_n[i], TINY)
+            sx <- sum(zi * xi)
+            slogx <- sum(zi * logxi)
+            old_beta_i <- old_scale[i, k]
+            fn_alpha_i <- function(alpha)
+              -log(old_beta_i) + slogx / sw - digamma(alpha)
+            fn_alpha2_i <- function(alpha) fn_alpha_i(alpha)^2
             # Solve the shape MLE equation: uniroot -> nlminb -> weighted
             # method-of-moments -> previous value. Each stage is validated to
             # return a finite, positive shape so the EM never errors here.
             new_shape <- tryCatch(
-              uniroot(fn_alpha, interval = c(1e-6, 1e4),
-                      beta = old_scale[i, k], z = zi, x = xi)$root,
+              uniroot(fn_alpha_i, interval = c(1e-6, 1e4))$root,
               error = function(e) tryCatch(
-                nlminb(old_shape[i, k], fn_alpha2, lower = 1e-8,
-                       beta = old_scale[i, k], z = zi, x = xi)$par,
+                nlminb(old_shape[i, k], fn_alpha2_i, lower = 1e-8)$par,
                 error = function(e2) NA_real_
               )
             )
             if (!is.finite(new_shape) || new_shape <= 0) {
               # Weighted method-of-moments fallback for the shape.
-              sw  <- max(sum(zi), TINY)
-              mu  <- sum(zi * xi) / sw
+              mu  <- sx / sw
               v   <- sum(zi * (xi - mu)^2) / sw
               new_shape <- if (is.finite(mu) && is.finite(v) && v > 0)
                 mu^2 / v else old_shape[i, k]
             }
             if (!is.finite(new_shape) || new_shape <= 0)
               new_shape <- old_shape[i, k]
-            new_scale <- fn_beta(zi, xi, new_shape)
+            new_scale <- sx / (sw * max(new_shape, TINY))
             if (!is.finite(new_scale) || new_scale <= 0)
               new_scale <- old_scale[i, k]
             temp[i] <- new_shape
