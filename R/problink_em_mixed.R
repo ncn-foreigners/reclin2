@@ -151,8 +151,8 @@
 #'
 #' @examples
 #' set.seed(1)
-#' nA <- 300; nB <- 60
-#' # one binary, one 3-level categorical, one continuous field
+#' nA <- 150; nB <- 40
+#' # one binary, one 5-level categorical, one continuous field
 #' A <- data.frame(
 #'   sex = sample(0:1, nA, replace = TRUE),
 #'   reg = sample(1:5, nA, replace = TRUE),

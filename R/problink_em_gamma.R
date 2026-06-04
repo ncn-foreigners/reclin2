@@ -66,6 +66,16 @@
 #'   package RNG and \emph{respect any seed set by the user} (the current RNG
 #'   state is saved and restored on exit), so results are reproducible under
 #'   \code{set.seed()} and the caller's random stream is left untouched.
+#' @param lambda_smooth non-negative smoothing strength (default \code{0} = exact
+#'   maximum-likelihood updates).  When \code{> 0}, the hurdle point-masses
+#'   \eqn{p_0} are shrunk towards their (per-component, per-field) \emph{starting}
+#'   values via a Dirichlet/Beta pseudo-count update
+#'   \eqn{(\sum q\,\mathbf{1}[g=0] + \lambda p_0^{0}) / (\sum q + \lambda)}.  Only
+#'   the hurdle probabilities are smoothed; the gamma shape and scale (which are
+#'   not probabilities) are left untouched.  The default \code{lambda_smooth = 0}
+#'   reproduces the unsmoothed fit exactly.  Mirrors the \code{lambda_smooth}
+#'   argument of \code{\link{problink_em_mixed}} and is useful when a field has
+#'   very few exact-zero (exact-match) distances.
 #' @param .start optional internal/testing hook.  A list with elements
 #'   \code{lambda} (length-2), \code{p0}, \code{alpha}, \code{beta} (each a
 #'   \eqn{2 \times K} matrix) giving \emph{explicit} EM starting values that
@@ -168,7 +178,7 @@
 #' @export
 problink_em_gamma <- function(formula, data, comparison_matrix,
     p0 = NULL, p0M = NULL, tol = 1e-6, maxits = 500,
-    use_envstats = FALSE, nstart = 1L, .start = NULL) {
+    use_envstats = FALSE, nstart = 1L, lambda_smooth = 0, .start = NULL) {
 
   cl <- match.call()
 
@@ -211,6 +221,9 @@ problink_em_gamma <- function(formula, data, comparison_matrix,
   if (length(nstart) != 1L || is.na(nstart) || nstart < 1L)
     stop("'nstart' must be a single integer >= 1.")
   if (!is.null(.start)) nstart <- 1L  # explicit start => single deterministic run
+  if (!is.numeric(lambda_smooth) || length(lambda_smooth) != 1L ||
+      !is.finite(lambda_smooth) || lambda_smooth < 0)
+    stop("'lambda_smooth' must be a single non-negative number.")
 
   # ----- Resolve initial match prevalence p0 -----
   # p0 is only the EM *start* value for the match-mixing weight; the match
@@ -280,7 +293,8 @@ problink_em_gamma <- function(formula, data, comparison_matrix,
   # the single deterministic start, so behaviour is unchanged.
   run_one <- function(start)
     .run_em_gammaK(X, K = K, N = N, start = start, tol = tol,
-                   maxits = maxits, MIN_EFF_N = MIN_EFF_N)
+                   maxits = maxits, MIN_EFF_N = MIN_EFF_N,
+                   lambda_smooth = lambda_smooth)
 
   best <- run_one(base_start)
 
@@ -560,7 +574,8 @@ clamp01_ <- function(p, lo = 1e-6) {
 #' denominator over the same variable). Only initialisation and numerical guards
 #' live around these updates.
 #' @noRd
-.run_em_gammaK <- function(X, K, N, start, tol, maxits, MIN_EFF_N) {
+.run_em_gammaK <- function(X, K, N, start, tol, maxits, MIN_EFF_N,
+                           lambda_smooth = 0) {
 
   ncomp <- 2L
   lambda_mle <- start$lambda
@@ -570,6 +585,11 @@ clamp01_ <- function(p, lo = 1e-6) {
 
   # Clamp p0 from below (matches the reference start exactly).
   p0_mle[p0_mle < 1/N] <- 1/N
+
+  # Per-component, per-field STARTING hurdle masses, used as the shrinkage target
+  # when lambda_smooth > 0. Captured AFTER the 1/N floor so the smoothing target
+  # is itself a valid probability. With lambda_smooth = 0 this is never read.
+  p0_start <- p0_mle
 
   # All denominators floored at TINY so a near-collapsed component cannot yield
   # NaN/Inf from a 0-weight division.
@@ -650,7 +670,16 @@ clamp01_ <- function(p, lo = 1e-6) {
       # empty) the numerator is 0 and p0 is pinned at its lower floor 1/N.
       p0_num <- colSums(z[ind0,  , drop = FALSE])
       p0_den <- pmax(colSums(z[obs_k, , drop = FALSE]), 1/N)
-      p0_mle[, k] <- clamp01_(p0_num / p0_den, lo = 1/N)
+      # Optional smoothing: shrink each component's hurdle mass towards its
+      # STARTING value via a Beta pseudo-count of strength lambda_smooth (the
+      # numerator adds lambda_smooth * p0_start, the denominator adds
+      # lambda_smooth). This is a purely additive operation, so lambda_smooth = 0
+      # reproduces the unsmoothed update p0_num / p0_den exactly. Only the hurdle
+      # probabilities are smoothed -- shape/scale are not probabilities and are
+      # left untouched.
+      p0_mle[, k] <- clamp01_(
+        (p0_num + lambda_smooth * p0_start[, k]) / (p0_den + lambda_smooth),
+        lo = 1/N)
 
       if (length(ind1) >= 2) {
         # Update shape via uniroot; fallback to nlminb

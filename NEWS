@@ -1,5 +1,27 @@
 
 
+CHANGES IN VERSION 0.7.0
+
+NEW FEATURES
+
+  - New `problink_em_gamma()` and `problink_em_mixed()` functions: continuous
+    (hurdle-gamma) and mixed-type (binary + categorical + continuous)
+    Fellegi-Sunter EM estimators, after Vo et al. (2023)
+    <doi:10.1016/j.csda.2022.107656>. These use the full numeric information in
+    near-but-not-exact matches (ages, incomes, coordinates) instead of a binary
+    agree/disagree comparison.
+
+  - New distance comparators `cmp_distance()`, `cmp_absdist()` and `cmp_levels()`
+    for generating continuous and ordinal-level comparison values.
+
+  - New vignette "Continuous and mixed-type comparisons" describing the new
+    estimators and comparators.
+
+  - `problink_em_gamma()` and `problink_em_mixed()` gain a `lambda_smooth`
+    argument that shrinks the estimated probabilities towards their starting
+    values, which is useful when a field has very few exact matches.
+
+
 CHANGES IN VERSION 0.5.1
 
 NEW FEATURES

@@ -14,6 +14,7 @@ problink_em_gamma(
   maxits = 500,
   use_envstats = FALSE,
   nstart = 1L,
+  lambda_smooth = 0,
   .start = NULL
 )
 }
@@ -79,6 +80,17 @@ the highest observed log-likelihood is returned.  The perturbations use the
 package RNG and \emph{respect any seed set by the user} (the current RNG
 state is saved and restored on exit), so results are reproducible under
 \code{set.seed()} and the caller's random stream is left untouched.}
+
+\item{lambda_smooth}{non-negative smoothing strength (default \code{0} = exact
+maximum-likelihood updates).  When \code{> 0}, the hurdle point-masses
+\eqn{p_0} are shrunk towards their (per-component, per-field) \emph{starting}
+values via a Dirichlet/Beta pseudo-count update
+\eqn{(\sum q\,\mathbf{1}[g=0] + \lambda p_0^{0}) / (\sum q + \lambda)}.  Only
+the hurdle probabilities are smoothed; the gamma shape and scale (which are
+not probabilities) are left untouched.  The default \code{lambda_smooth = 0}
+reproduces the unsmoothed fit exactly.  Mirrors the \code{lambda_smooth}
+argument of \code{\link{problink_em_mixed}} and is useful when a field has
+very few exact-zero (exact-match) distances.}
 
 \item{.start}{optional internal/testing hook.  A list with elements
 \code{lambda} (length-2), \code{p0}, \code{alpha}, \code{beta} (each a

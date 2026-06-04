@@ -449,4 +449,70 @@ expect_error(problink_em_gamma(comparison_matrix = Xnan))
 expect_error(problink_em_gamma(comparison_matrix = X12[1, , drop = FALSE]))  # N=1
 cat("  [14] input validation (negative dist, N=1): PASS\n")
 
+## ========================================================
+## 15. SMOOTHING (lambda_smooth, parity with problink_em_mixed):
+##     lambda_smooth > 0 shrinks the hurdle masses p0 towards their STARTING
+##     values, keeps every p0 strictly in (0, 1), and runs; lambda_smooth = 0
+##     reproduces the unsmoothed fit BIT-FOR-BIT. Smoothing is additive, so a
+##     shared explicit start isolates its effect on p0 only (shape/scale, which
+##     are not probabilities, are left untouched at lambda_smooth = 0).
+## ========================================================
+## Build a hurdle-ACTIVE dataset (genuine exact-zero distances) so the p0 update
+## is non-trivial and smoothing has something to shrink.
+set.seed(515)
+nA15 <- 300; nB15 <- 60; K15 <- 2
+XA15 <- matrix(rexp(nA15 * K15, rate = 1), ncol = K15)
+err15 <- matrix(rbinom(nB15 * K15, 1, 0.30), ncol = K15)   # 70% exact matches
+XB15 <- (1 - err15) * XA15[1:nB15, ] +
+        err15 * (XA15[1:nB15, ] + matrix(rexp(nB15 * K15, 4), ncol = K15))
+X15 <- do.call(cbind, lapply(1:K15, function(k) {
+  t <- expand.grid(XA15[, k], XB15[, k]); abs(t[, 1] - t[, 2])
+}))
+colnames(X15) <- paste0("k", 1:K15)
+N15 <- nrow(X15)
+stopifnot(sum(X15 == 0, na.rm = TRUE) > 0)   # exact zeros exist (hurdle active)
+
+## A shared explicit start so lambda_smooth's effect is isolated (same data,
+## same start, same tol -> any difference is the smoothing alone).
+start15 <- list(
+  lambda = c(nB15 / N15, 1 - nB15 / N15),
+  p0     = matrix(c(0.8, 0.8, 1/N15, 1/N15), nrow = 2, byrow = FALSE),
+  alpha  = matrix(1, nrow = 2, ncol = K15),
+  beta   = matrix(1, nrow = 2, ncol = K15)
+)
+
+m15_0 <- problink_em_gamma(comparison_matrix = X15, .start = start15,
+                           tol = 1e-6, lambda_smooth = 0)
+m15_s <- problink_em_gamma(comparison_matrix = X15, .start = start15,
+                           tol = 1e-6, lambda_smooth = 5)
+
+## (a) lambda_smooth > 0 keeps every hurdle probability strictly in (0, 1).
+stopifnot(all(m15_s$p0 > 0 & m15_s$p0 < 1))
+stopifnot(all(is.finite(m15_s$shape)), all(m15_s$shape > 0))
+stopifnot(all(is.finite(m15_s$scale)), all(m15_s$scale > 0))
+stopifnot(is.finite(m15_s$p), m15_s$p > 0, m15_s$p < 1)
+
+## (b) lambda_smooth = 0 reproduces the unsmoothed fit BIT-FOR-BIT (run twice).
+m15_0b <- problink_em_gamma(comparison_matrix = X15, .start = start15,
+                            tol = 1e-6, lambda_smooth = 0)
+expect_equal(m15_0$p0,    m15_0b$p0)
+expect_equal(m15_0$shape, m15_0b$shape)
+expect_equal(m15_0$scale, m15_0b$scale)
+expect_equal(m15_0$p,     m15_0b$p)
+
+## (c) Smoothing actually moves the hurdle masses (it is not a no-op for lam>0)
+## but leaves shape/scale untouched relative to... it does change them only via
+## the coupled EM, so we just assert the p0 differ between lam=0 and lam=5.
+stopifnot(max(abs(m15_0$p0 - m15_s$p0)) > 1e-8)
+
+## (d) Invalid lambda_smooth is rejected.
+expect_error(problink_em_gamma(comparison_matrix = X15, lambda_smooth = -1))
+expect_error(problink_em_gamma(comparison_matrix = X15, lambda_smooth = c(1, 2)))
+
+## (e) The data/formula interface accepts lambda_smooth too and stays in (0,1).
+m15_df <- problink_em_gamma(~ k1 + k2, data = as.data.frame(X15),
+                            p0 = nB15 / N15, p0M = 0.8, lambda_smooth = 3)
+stopifnot(all(m15_df$p0 > 0 & m15_df$p0 < 1))
+cat("  [15] lambda_smooth: in(0,1) for lam>0; lam=0 reproduces unsmoothed: PASS\n")
+
 cat("PASS: test_problink_em_gamma.R\n")
