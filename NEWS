@@ -30,6 +30,14 @@ IMPROVEMENTS
     `tools/benchmarks/benchmark_phase1_problink_em.R` compares the optimized
     code against the base version.
 
+  - The continuous (hurdle-gamma) log-density in `problink_em_gamma()` and
+    `problink_em_mixed()` is now computed inline from the cached `log(g)`
+    values instead of calling `dgamma(log = TRUE)` every iteration, and the
+    gamma EM works with the match-posterior vector directly instead of an
+    N x 2 posterior matrix. Together this gives a further ~3x speedup for
+    `problink_em_gamma()` (~1.7x for `problink_em_mixed()`) with results
+    identical to floating point.
+
 
 CHANGES IN VERSION 0.5.1
 

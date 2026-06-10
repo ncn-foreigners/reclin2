@@ -714,9 +714,12 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
             ld[info$zero] <- log(pmax(f$p0[j], TINY))
           }
           if (length(info$pos)) {
+            # Inlined log dgamma(g; shape, scale) using the cached log(g)
+            # (see .run_em_gammaK): avoids recomputing log(g) inside
+            # dgamma(log = TRUE) every iteration, the EM's dominant cost.
             lp <- log1p(-f$p0[j]) +
-              dgamma(info$xpos, shape = f$alpha[j], scale = f$beta[j],
-                     log = TRUE)
+              (f$alpha[j] - 1) * info$logxpos - info$xpos / f$beta[j] -
+              (f$alpha[j] * log(f$beta[j]) + lgamma(f$alpha[j]))
             lp <- pmax(lp, LOG_DENS_FLOOR)
             lp[!is.finite(lp)] <- LOG_DENS_FLOOR
             ld[info$pos] <- lp
@@ -743,13 +746,8 @@ problink_em_mixed <- function(formula, data, comparison_matrix, types = NULL,
     list(q = q, loglik = sum(denom[is.finite(denom)]))
   }
 
-  # ---- gamma shape/scale M-step (reuse problink_em_gamma's equations) ----
-  fn_alpha <- function(alpha, beta, z, x)
-    -log(beta) + sum(z * log(x)) / max(sum(z), TINY) - digamma(alpha)
-  fn_alpha2 <- function(alpha, beta, z, x)
-    (-log(beta) + sum(z * log(x)) / max(sum(z), TINY) - digamma(alpha))^2
-  fn_beta  <- function(z, x, alpha)
-    sum(z * x) / (max(sum(z), TINY) * max(alpha, TINY))
+  # ---- gamma shape/scale M-step (same equations as problink_em_gamma; the
+  # per-field closures fn_alpha_i/fn_alpha2_i are built inline in the loop) ----
   MIN_EFF_N <- 3
 
   LL <- .logL_mat(fields)
