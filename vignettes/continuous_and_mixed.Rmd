@@ -1,0 +1,574 @@
+---
+title: "Continuous and mixed-type comparisons in reclin2"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Continuous and mixed-type comparisons}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## Introduction
+
+The classic Fellegi-Sunter model in `reclin2` (see the *Introduction* vignette)
+compares records on *binary* agreement: for each linkage key a pair either
+agrees or it does not. This works very well when the matching records agree
+*exactly* on their keys -- names after standardisation, postcodes, dates of
+birth that were copied without error.
+
+It throws information away, however, when the keys are *numeric* and the
+matching records are *close but rarely exactly equal*: ages, incomes,
+coordinates, dates measured to the day, sensor readings. Two records for the
+same person might have ages 41 and 42, or incomes 30 000 and 30 150 -- clearly
+similar, but a binary comparator scores both disagreements identically to a
+comparison of 41 against 88.
+
+This vignette covers two estimators that use the full numeric information:
+
+- `problink_em_gamma()` -- a **continuous** Fellegi-Sunter model. It models the
+  comparison *distance* (e.g. `|age_x - age_y|`) with a two-component
+  hurdle-gamma mixture: a small mean distance for matches, a large one for
+  non-matches.
+- `problink_em_mixed()` -- a **mixed-type** model in which each field can be
+  binary, categorical (ordinal agreement levels) or continuous, combined under
+  the usual conditional-independence assumption.
+
+Both produce exactly the same output columns as the standard `problink_em`, so
+`predict()`, `select_threshold()`, `select_n_to_m()`, `link()` and friends work
+unchanged.
+
+The estimators follow the extension of the Fellegi-Sunter model to numeric and
+mixed-type comparisons proposed by Vo, Chauvet, Happe, Oger, Paquelet and
+Garès (2023), "Extending the Fellegi-Sunter record linkage model for mixed-type
+data", *Computational Statistics & Data Analysis* **179**:107656.
+
+> **When does this help?** When matches agree *exactly* on their keys, plain
+> binary Fellegi-Sunter already does well and is simpler -- reach for it first.
+> The continuous and mixed models earn their keep when matches are
+> *close-but-rarely-exact*, which is precisely where binary comparison loses
+> information.
+
+```{r libs, message = FALSE}
+library(reclin2)
+library(data.table)
+```
+
+## Theory: the Fellegi-Sunter model and its extensions
+
+### The classic Fellegi-Sunter recap
+
+For a candidate pair $(i, j)$ formed from records in two files $A$ and $B$, the
+Fellegi-Sunter model introduces a **latent match indicator**
+$g_{ij} \in \{0, 1\}$: $g_{ij} = 1$ if the pair is a true *match* (the two
+records describe the same entity, the set $M$) and $g_{ij} = 0$ if it is a
+*non-match* (the set $U$). What we observe instead is a **comparison vector**
+$\gamma_{ij} = (\gamma_{ij}^{(1)}, \dots, \gamma_{ij}^{(K)})$ summarising how the
+pair agrees on each of $K$ linkage fields.
+
+The model is a two-component mixture governed by:
+
+- the **match prevalence** $p_M = \Pr(g_{ij} = 1)$, the overall probability that
+  a random pair is a match;
+- the **m-parameters** $\Pr(\gamma \mid M)$, the distribution of the comparison
+  vector among true matches;
+- the **u-parameters** $\Pr(\gamma \mid U)$, the distribution among non-matches.
+
+Under the standard **conditional independence** assumption, the comparison
+fields are independent given match status, so the joint comparison densities
+factorise across fields,
+
+$$
+\Pr(\gamma_{ij} \mid M) = \prod_{k=1}^{K} \Pr\!\big(\gamma_{ij}^{(k)} \mid M\big),
+\qquad
+\Pr(\gamma_{ij} \mid U) = \prod_{k=1}^{K} \Pr\!\big(\gamma_{ij}^{(k)} \mid U\big).
+$$
+
+Linkage decisions are driven by the **posterior match probability** obtained
+from Bayes' rule,
+
+$$
+q_{ij}
+= \Pr(M \mid \gamma_{ij})
+= \frac{p_M\,\Pr(\gamma_{ij}\mid M)}
+       {p_M\,\Pr(\gamma_{ij}\mid M) + (1-p_M)\,\Pr(\gamma_{ij}\mid U)},
+$$
+
+or, equivalently, by the **matching weight** -- the log-likelihood ratio that
+accumulates additively over fields,
+
+$$
+w_{ij}
+= \log\frac{\Pr(\gamma_{ij}\mid M)}{\Pr(\gamma_{ij}\mid U)}
+= \sum_{k=1}^{K}
+  \log\frac{\Pr(\gamma_{ij}^{(k)}\mid M)}{\Pr(\gamma_{ij}^{(k)}\mid U)}.
+$$
+
+In the *classic* model each $\gamma^{(k)}$ is **binary** (agree/disagree), so
+each field contributes the familiar $m_k = \Pr(\text{agree}\mid M)$ and
+$u_k = \Pr(\text{agree}\mid U)$. The two estimators below keep this exact mixture
+skeleton -- same $p_M$, same posterior $q_{ij}$, same additive weight -- but
+**replace the per-field densities** so that numeric and mixed comparison vectors
+can be modelled directly (Vo et al., 2023).
+
+### Continuous fields: the hurdle-gamma model
+
+For a continuous key the comparison is no longer agree/disagree but a
+**distance** $\gamma = |x - y| \ge 0$, where $\gamma = 0$ is an exact match and
+larger values mean greater dissimilarity (this is exactly what `cmp_distance()`
+returns). Distances are non-negative and have an *atom at zero* -- exact
+agreements do happen for rounded data -- so a plain gamma density is not enough.
+`problink_em_gamma()` models each field/component with a **hurdle-gamma**
+density,
+
+$$
+f(\gamma;\, p_0, \alpha, \beta) =
+\begin{cases}
+p_0, & \gamma = 0,\\[4pt]
+(1 - p_0)\,\operatorname{dgamma}(\gamma;\ \text{shape}=\alpha,\ \text{scale}=\beta),
+  & \gamma > 0,
+\end{cases}
+$$
+
+with a point mass $p_0$ on an exact match ("hurdle") and a gamma density for the
+positive distances. Each of the two components (match $C=M$, non-match $C=U$) has
+its own $(p_{0,C}, \alpha_C, \beta_C)$; the gamma **mean distance** is
+$\alpha_C \beta_C$, small for matches and large for non-matches. The pair-level
+density used in the mixture is the product over fields,
+$\Pr(\gamma \mid C) = \prod_k f(\gamma^{(k)};\, p_{0,C}^{(k)}, \alpha_C^{(k)}, \beta_C^{(k)})$.
+
+The parameters are fitted by EM. The **E-step** computes the posterior
+$q_{ij} = \Pr(M \mid \gamma_{ij})$ with the Bayes formula above, using these
+hurdle-gamma densities. The **M-step** maximises the expected complete-data
+log-likelihood, giving, with weights $q_{ij}$ (match) and $1 - q_{ij}$
+(non-match):
+
+- match prevalence (overall mean posterior),
+  $$
+  p_M = \frac{1}{N}\sum_{ij} q_{ij};
+  $$
+- hurdle point mass (weighted fraction of exact zeros), for each component and
+  field,
+  $$
+  p_0 = \frac{\sum_{ij} q_{ij}\,\mathbf{1}[\gamma_{ij}=0]}{\sum_{ij} q_{ij}};
+  $$
+- gamma **shape** $\alpha$, the root of the weighted score equation
+  $$
+  -\log\beta + \frac{\sum w\,\log\gamma}{\sum w} - \psi(\alpha) = 0,
+  $$
+  where $\psi$ is the digamma function and the weights are
+  $w = q\,\mathbf{1}[\gamma > 0]$ for the match component (and
+  $w = (1-q)\,\mathbf{1}[\gamma > 0]$ for the non-match component) -- i.e. only
+  the positive distances enter the gamma update;
+- gamma **scale** $\beta$ (closed form given $\alpha$),
+  $$
+  \beta = \frac{\sum w\,\gamma}{\alpha \sum w}.
+  $$
+
+When the data contain **no exact agreements** the numerator of every $p_0$
+update is zero, so $p_0 \to 0$ (numerically, its floor) and the hurdle switches
+off: the model collapses to an ordinary two-component gamma mixture over the
+distances. This is the correct maximum-likelihood behaviour, not a failure --
+matches are still recovered from the separation of the two gamma components.
+`problink_em_gamma()` detects this regime and reports the hurdle as *inactive*.
+
+### Mixed-type fields: a product of per-field blocks
+
+Real linkage keys mix kinds: a sex indicator, a region code, an age, an income.
+Under the same conditional-independence factorisation, each field contributes its
+**own block** to $\Pr(\gamma \mid M)$ and $\Pr(\gamma \mid U)$ according to its
+type, and the EM skeleton is unchanged -- only the per-field M-step differs (Vo
+et al., 2023):
+
+- **binary (Bernoulli).** $\gamma \in \{0, 1\}$; the block is
+  $m^{\gamma}(1-m)^{1-\gamma}$ with $m = \Pr(\text{agree}\mid C)$. Closed-form
+  M-step:
+  $$
+  m = \frac{\sum_{ij} q_{ij}\,\gamma_{ij}}{\sum_{ij} q_{ij}}
+  $$
+  for the match component (and the analogous $(1-q)$-weighted update for the
+  non-match component $u$).
+- **categorical (multinomial, $L$ levels).** $\gamma \in \{0, \dots, L-1\}$ is an
+  ordinal agreement level (e.g. from `cmp_levels()`); the block is
+  $\prod_{s} m_s^{\mathbf{1}[\gamma = s]}$ with $\sum_s m_s = 1$. Closed-form
+  M-step (weighted relative frequency of each level):
+  $$
+  m_s = \frac{\sum_{ij} q_{ij}\,\mathbf{1}[\gamma_{ij}=s]}{\sum_{ij} q_{ij}},
+  \qquad s = 0, \dots, L-1.
+  $$
+- **continuous.** the hurdle-gamma block from the previous section, with its
+  $(p_0, \alpha, \beta)$ updated exactly as in `problink_em_gamma()`.
+
+So the binary and categorical updates are closed form, while the continuous
+update is the gamma score-equation solve. A model in which *every* field is
+continuous reduces **exactly** to `problink_em_gamma()`.
+
+## Comparators that return distances
+
+Two new comparators feed these models:
+
+- `cmp_distance(scale, transform)` returns the scaled absolute distance
+  `|x - y| / scale`; **0 means an exact match** and larger values mean greater
+  dissimilarity. `cmp_absdist()` is the shorthand `cmp_distance(scale = 1)`.
+- `cmp_levels(breaks)` discretises `|x - y|` into ordinal *agreement levels*
+  using cut points. `cmp_levels(c(0, 3))` gives level `0` for an exact match,
+  `1` for a distance in `(0, 3]` and `2` for a distance above `3`.
+
+```{r comparators}
+cmp_distance()(c(41, 30000, 5), c(42, 30150, 5))   # distances; 0 = exact
+cmp_levels(c(0, 3))(c(0, 2, 10), c(0, 0, 0))       # ordinal levels 0/1/2
+```
+
+Both comparators are *polymorphic*: called with a single argument they fall
+back to a binary "exact match" result, so they can also be handed to the
+classic `problink_em`.
+
+## Continuous linkage with `problink_em_gamma`
+
+We simulate a register `A` and a second file `B` that contains 80 of the same
+people, each measured on three numeric keys with a small amount of error. The
+errors are tiny relative to the spread of the keys, so matching records are
+*close*, but -- being continuous -- essentially **never exactly equal**.
+
+```{r cont-sim}
+set.seed(2025)
+nA <- 400L; nB <- 80L
+A <- data.table(
+  id = 1:nA,
+  x1 = runif(nA, 0, 100),
+  x2 = runif(nA, 0, 100),
+  x3 = runif(nA, 0, 100)
+)
+B <- A[1:nB]
+B[, x1 := x1 + rnorm(nB, 0, 1)]
+B[, x2 := x2 + rnorm(nB, 0, 1)]
+B[, x3 := x3 + rnorm(nB, 0, 1)]
+
+# Not a single exact agreement, even though all 80 are true matches:
+sum(A$x1[1:nB] == B$x1)
+```
+
+We generate all pairs and compare them with `cmp_distance()`. Because the keys
+contain errors we do not block on them; in a real application you would block on
+a separate, reliable key.
+
+```{r cont-pairs}
+pairs <- pair(A, B)
+pairs <- compare_pairs(pairs, on = c("x1", "x2", "x3"),
+  default_comparator = cmp_distance())
+print(pairs)
+```
+
+The comparison columns now hold distances rather than `TRUE`/`FALSE`. We fit the
+continuous model with a formula, exactly as with `problink_em`:
+
+```{r cont-fit}
+model <- problink_em_gamma(~ x1 + x2 + x3, data = pairs)
+print(model)
+```
+
+The printout gives, per field and per component (match vs non-match): the hurdle
+mass `p0` (the probability of an *exact* zero distance) and the gamma `shape`
+and `scale`. Read off the **mean distance** as `shape * scale`: for a match it
+is small (the keys nearly agree), for a non-match it is large.
+
+Two diagnostics are worth noting:
+
+- The **match prevalence** `p` is re-estimated by the EM; its starting value
+  `p0` is derived from the data (see *Notes* below).
+- The **hurdle point mass** is reported as *inactive* here: there are no exact
+  matches in this purely continuous data, so each `p0` collapses to its floor
+  `1/N` and the model becomes a plain two-component gamma mixture. That is the
+  correct maximum-likelihood behaviour, not a failure -- the matches are still
+  recovered from the separation of the two gamma components.
+
+We score and select exactly as in the standard workflow. `predict(type =
+"mpost")` adds the posterior match probability; `select_threshold` keeps the
+pairs above a cut-off. We then attach the truth (we know it here because `id`
+identifies the same person in both files) and evaluate.
+
+```{r cont-eval}
+pairs <- predict(model, pairs, type = "mpost", add = TRUE)
+pairs <- select_threshold(pairs, "selected", "mpost", threshold = 0.5)
+pairs <- compare_vars(pairs, "truth", on_x = "id", on_y = "id")
+
+table(truth = pairs$truth, selected = pairs$selected)
+```
+
+```{r cont-tprppv}
+TP <- sum(pairs$truth & pairs$selected)
+FP <- sum(!pairs$truth & pairs$selected)
+FN <- sum(pairs$truth & !pairs$selected)
+c(TPR = TP / (TP + FN), PPV = TP / (TP + FP))
+```
+
+The continuous model recovers almost all of the 80 matches with few false
+links. As in the introduction, forcing one-to-one linkage with `select_n_to_m`
+(which also accepts the `weights` column) does even better:
+
+```{r cont-ntom}
+pairs <- predict(model, pairs, type = "weights", add = TRUE)
+pairs <- select_n_to_m(pairs, "ntom", "weights", threshold = 0)
+table(truth = pairs$truth, ntom = pairs$ntom)
+```
+
+### Why not just use binary Fellegi-Sunter here?
+
+On this data the keys never agree exactly, so a binary comparator marks *every*
+pair as a disagreement on *every* field and the classic EM has nothing to
+separate matches from non-matches:
+
+```{r cont-binary}
+pb <- pair(A, B)
+pb <- compare_pairs(pb, on = c("x1", "x2", "x3"),
+  default_comparator = cmp_identical())
+# binary FS cannot fit when nothing agrees exactly; the warnings are expected
+mb <- suppressWarnings(problink_em(~ x1 + x2 + x3, data = pb))
+pb <- predict(mb, pairs = pb, type = "mpost", add = TRUE)
+pb <- select_threshold(pb, "selected", "mpost", threshold = 0.5)
+pb <- compare_vars(pb, "truth", on_x = "id", on_y = "id")
+c(selected = sum(pb$selected), found = sum(pb$truth & pb$selected))
+```
+
+It selects nothing: the binary model is the wrong tool for purely continuous
+keys.
+
+### The pure-continuous regime and `nstart`
+
+When there are *no* exact matches at all (as above), the two-component gamma
+mixture can occasionally settle on a poor local optimum from a single start.
+Running several starts and keeping the best log-likelihood makes the fit much
+more robust. Use `nstart >= 10` in this regime; with `nstart = 1` the estimator
+is fully deterministic, and `nstart > 1` is reproducible under `set.seed()`:
+
+```{r cont-nstart}
+set.seed(1)
+model_ms <- problink_em_gamma(~ x1 + x2 + x3, data = pairs, nstart = 10)
+model_ms$loglik >= model$loglik       # multistart is never worse
+```
+
+## Mixed-type linkage with `problink_em_mixed`
+
+Real linkage keys are rarely all of one kind. `problink_em_mixed` lets each
+field be **binary**, **categorical** (ordinal agreement levels) or
+**continuous**, and fits them jointly. We build a file with one of each:
+
+- `sex` -- a binary field, compared with `cmp_identical()`;
+- `reg` -- a region code with many values; we compare it with `cmp_levels(c(0,
+  3))` to get ordinal agreement (exact / close / far);
+- `age` and `inc` -- continuous, compared with `cmp_distance()`.
+
+```{r mixed-sim}
+set.seed(101)
+nA <- 400L; nB <- 80L
+A <- data.table(
+  id  = 1:nA,
+  sex = sample(0:1, nA, replace = TRUE),
+  reg = sample(1:50, nA, replace = TRUE),
+  age = round(runif(nA, 18, 85)),
+  inc = round(rgamma(nA, shape = 2, scale = 20000))
+)
+B <- A[1:nB]
+ix <- sample(nB, round(nB * 0.05)); B$sex[ix] <- 1 - B$sex[ix]
+ix <- sample(nB, round(nB * 0.10)); B$reg[ix] <- sample(1:50, length(ix), replace = TRUE)
+B[, age := age + rbinom(nB, 1, 0.3) * sample(1:4, nB, replace = TRUE)]
+B[, inc := inc + round(rnorm(nB, 0, 800))]
+
+pairs <- pair(A, B)
+pairs <- compare_pairs(pairs, on = c("sex", "reg", "age", "inc"),
+  comparators = list(
+    sex = cmp_identical(),     # binary
+    reg = cmp_levels(c(0, 3)), # ordinal: 0 exact, 1 within 3, 2 far
+    age = cmp_distance(),      # continuous distance
+    inc = cmp_distance()       # continuous distance
+  ))
+print(pairs)
+```
+
+We fit with `problink_em_mixed`. It **auto-detects** the comparison type of each
+field and reports it via a message:
+
+- a column whose values are all in `{0, 1}` -> `binary`;
+- non-negative integers with few distinct values -> `categorical`;
+- anything else -> `continuous`.
+
+```{r mixed-fit}
+model <- problink_em_mixed(~ sex + reg + age + inc, data = pairs)
+print(model)
+```
+
+The printout shows one block per field: `m`/`u` agreement probabilities for the
+binary field, the per-level `m`/`u` probabilities for the categorical field, and
+the hurdle-gamma `p0`/`shape`/`scale` for each continuous field. The continuous
+`age` block has its hurdle mass `p0` *active*: ages do sometimes agree exactly,
+and the model uses that.
+
+Scoring, selection and evaluation are identical to every other model in the
+package:
+
+```{r mixed-eval}
+pairs <- predict(model, pairs, type = "mpost", add = TRUE)
+pairs <- select_threshold(pairs, "selected", "mpost", threshold = 0.5)
+pairs <- compare_vars(pairs, "truth", on_x = "id", on_y = "id")
+
+table(truth = pairs$truth, selected = pairs$selected)
+```
+
+```{r mixed-tprppv}
+TP <- sum(pairs$truth & pairs$selected)
+FP <- sum(!pairs$truth & pairs$selected)
+FN <- sum(pairs$truth & !pairs$selected)
+c(TPR = TP / (TP + FN), PPV = TP / (TP + FP))
+```
+
+### Overriding the inferred types
+
+Auto-detection has one genuinely ambiguous case: an *integer-valued distance*
+with few distinct values (for example a date lag binned to `0, 1, 2, ...`)
+detects as `categorical`, even though you might want it treated as a continuous
+distance. Pass `types =` to override any field; unnamed fields keep their
+detected type:
+
+```{r mixed-override}
+model2 <- problink_em_mixed(~ sex + reg + age + inc, data = pairs,
+  types = list(reg = "continuous"))
+model2$types
+```
+
+## Under the hood: estimation and numerics
+
+This section maps the theory above onto what the implementation actually does.
+The continuous estimator lives in `R/problink_em_gamma.R`
+(`problink_em_gamma()`), the mixed-type estimator in `R/problink_em_mixed.R`
+(`problink_em_mixed()`), the comparators in `R/comparators_distance.R`
+(`cmp_distance()`, `cmp_levels()`), and scoring in the two `predict.*` methods.
+
+**E-step on the log scale (log-sum-exp).** With many fields the raw density
+products $\prod_k f(\gamma^{(k)})$ underflow to zero in double precision, which
+would turn the posterior into $0/0$. The mixed estimator therefore accumulates
+**per-field log-densities** and combines the two weighted components with a
+log-sum-exp,
+$$
+q = \frac{\exp(a)}{\exp(a) + \exp(b)},\quad
+a = \log p_M + \sum_k \log f_M(\gamma^{(k)}),\quad
+b = \log(1-p_M) + \sum_k \log f_U(\gamma^{(k)}),
+$$
+evaluated as $q = \exp\!\big(a - m - \log(e^{a-m} + e^{b-m})\big)$ with
+$m = \max(a, b)$. This is numerically what the Bayes posterior $q_{ij}$ in the
+theory computes, just done safely.
+
+**Data-driven initialisation.** Good starts matter for mixture EM, so the
+defaults are derived from the data rather than fixed:
+
+- the match-prevalence start is blocking-aware,
+  `p0 = min(nA, nB) / nrow(pairs)` -- the largest plausible match rate (every
+  record in the smaller file matches). Because `nrow(pairs)` already reflects any
+  blocking you applied, the start adapts automatically; it is re-estimated by the
+  EM. When the source-table sizes are unavailable (e.g. the
+  `comparison_matrix =` interface) it falls back to `0.05`, clamped to
+  `[1/N, 0.5]`.
+- the hurdle point mass `p0M` for each continuous field is seeded from the
+  *observed* exact-zero fraction `z_k = mean(distance == 0)`, inflated by the
+  match prevalence (the zeros that occur are mostly contributed by true matches).
+  With no exact matches `z_k = 0`, so `p0M -> 1/N` and the hurdle starts (and
+  stays) inactive.
+- the gamma `shape`/`scale` are seeded by splitting each field's *positive*
+  distances into a small "match" tail (the smallest ones) and a "non-match" bulk
+  (the rest) and fitting a gamma to each by method of moments (or
+  `EnvStats::egamma` when `use_envstats = TRUE`).
+
+**Robustness and numerical hardening.** The updates are guarded so the EM can
+never error or emit `NaN`:
+
+- every probability is clamped to $[1/N,\, 1 - 1/N]$ and every M-step
+  denominator is floored away from zero, so a near-collapsed component cannot
+  produce $0/0$;
+- the gamma **shape** solver degrades gracefully through a chain:
+  `uniroot` -> `nlminb` -> weighted method-of-moments -> previous value, each
+  stage validated to return a finite positive shape (an `alpha`/shape guard);
+- an optional additive smoothing strength `lambda_smooth` (default `0`, i.e.
+  exact maximum likelihood) shrinks each probability update towards its initial
+  value, e.g. $m_s = (\sum q\,\mathbf{1} + \lambda\, m_s^{0}) / (\sum q +
+  \lambda)$, which helps with sparse categorical levels;
+- `NA` comparison values are dropped per field during fitting and contribute a
+  neutral factor (log-density `0`) in scoring.
+
+**Multistart (`nstart`).** With `nstart = 1` (the default) a single deterministic
+data-driven start is used and the result is fully reproducible. With
+`nstart > 1` the estimator runs that start first, then `nstart - 1` *perturbed*
+starts (log-normal jitter of the parameters), and keeps the fit with the largest
+observed log-likelihood. The perturbations use the package RNG and **respect any
+`set.seed()`** (the RNG state is saved and restored on exit, leaving the caller's
+stream untouched), so multistart fits are reproducible. `nstart >= 10` is
+recommended in the pure-continuous regime, where the gamma mixture can have local
+optima.
+
+**Label-switching guard.** A mixture is invariant to relabelling its components,
+so after convergence the estimators relabel so that **component 1 is always the
+match**. The decision is *discriminative-power-weighted*: each field votes by the
+size of its match/non-match separation (binary $|m - u|$; categorical, mass on
+the exact-agreement level; continuous, the hurdle mass $p_0$ and the mean
+distance $\alpha\beta$). Weighting by separation means an uninformative field
+(where $m \approx u$) cannot flip the labels; on an exact tie the smaller mixing
+component is taken as the match.
+
+**Auto-detection and overrides.** `problink_em_mixed()` inspects each comparison
+column and assigns a type: values in $\{0, 1\}$ become `binary`; non-negative
+integers with few distinct values (at most `maxlevels`, default `10`) become
+`categorical`; everything else becomes `continuous`. The inferred types are
+reported via `message()`. The one genuinely ambiguous case is an integer-valued
+*distance* with few distinct levels (e.g. a binned date lag), which detects as
+`categorical`; pass `types =` to force it to `continuous` (or any field to any
+type).
+
+**Drop-in scoring.** Both `predict` methods compute, for each field, the
+per-field log density ratio $\log(d_M / d_U)$ by block (Bernoulli, multinomial,
+or hurdle-gamma), sum them into the matching weight $w_{ij}$, and form the
+posterior $q_{ij} = m\,p_M / (m\,p_M + u\,(1 - p_M))$ from the density products.
+Crucially they return the **same columns** as `predict.problink_em`
+(`weights`, or `mprob`/`uprob`/`mpost`/`upost`). Consequently
+`select_threshold`, `select_greedy`, `select_n_to_m`, `select_unique` and `link`
+all work without any changes -- only the *estimator* differs from the classic
+workflow.
+
+## Notes and diagnostics
+
+- **`p0` auto-derivation (blocking-aware).** When you do not supply `p0`, the
+  EM start for the match prevalence is taken from the pairs object as
+  `min(nA, nB) / nrow(pairs)` -- the largest plausible match rate (every record
+  in the smaller file matches). Because `nrow(pairs)` already reflects any
+  blocking, the start adapts to how many pairs you generated. It is only a
+  *starting* value: the prevalence is re-estimated by the algorithm. Supply an
+  explicit `p0` to override.
+
+- **No exact matches is fine.** In the pure-continuous regime every `p0`
+  converges to its floor `1/N`; `print()` reports the hurdle as *inactive* and
+  the model is a plain gamma mixture. This is the correct MLE, and matches are
+  recovered from the gamma-component separation. (Use `nstart >= 10` here, as
+  shown above.)
+
+- **Diagnostics.** Both `print()` methods report the fitted parameters, the
+  initial and fitted match prevalence, the number of EM iterations and whether
+  the algorithm converged; `summary()` adds the mean distances and
+  log-likelihood. `problink_em_gamma` additionally reports the hurdle activity
+  flag, and `problink_em_mixed` lists the inferred per-field types.
+
+- **Drop-in output.** `predict()` for both models returns the same columns as
+  `predict.problink_em` (`weights`, or `mprob`/`uprob`/`mpost`/`upost` via
+  `type = "probs"`/`"all"`). Consequently `select_threshold`, `select_greedy`,
+  `select_n_to_m`, `select_unique` and `link` all work without any changes --
+  only the *estimator* differs from the classic workflow.
+
+## References
+
+Fellegi, I. P. and A. B. Sunter (1969). "A Theory for Record Linkage."
+*Journal of the American Statistical Association* **64**(328): 1183-1210.
+
+Vo, T. K. D., G. Chauvet, A. Happe, E. Oger, S. Paquelet and V. Garès (2023).
+"Extending the Fellegi-Sunter record linkage model for mixed-type data."
+*Computational Statistics & Data Analysis* **179**: 107656.

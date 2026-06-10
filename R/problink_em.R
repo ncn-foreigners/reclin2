@@ -61,57 +61,70 @@ problink_em <- function(formula, data, patterns, mprobs0 = list(0.95),
   if (!is.numeric(p0) || length(p0) > 1 || p0 < 0 || p0 > 1)
     stop("p0 should be a number between 0 and 1.")
   # initialisation
-  mprobs <- mprobs_prev <- mprobs0
-  uprobs <- uprobs_prev <- uprobs0
+  G <- do.call(cbind, lapply(by, function(col) as.logical(patterns[[col]])))
+  colnames(G) <- by
+  notG <- !G
+  n <- as.numeric(patterns$n)
+  mprobs <- mprobs_prev <- as.numeric(mprobs0)
+  uprobs <- uprobs_prev <- as.numeric(uprobs0)
+  names(mprobs) <- names(uprobs) <- by
   p      <- p_prev      <- p0
+  logprob_patterns <- function(prob) {
+    if (all(prob > 0 & prob < 1)) {
+      return(as.numeric(G %*% log(prob) + notG %*% log1p(-prob)))
+    }
+    lp <- numeric(nrow(G))
+    agree <- log(prob)
+    disagree <- log1p(-prob)
+    for (i in seq_along(prob)) {
+      lp[G[, i]] <- lp[G[, i]] + agree[i]
+      lp[notG[, i]] <- lp[notG[, i]] + disagree[i]
+    }
+    lp
+  }
   recalculate_p_and_stop <- FALSE
   while (TRUE) {
-    # estep
-    a <- rep(1, nrow(patterns))
-    b <- rep(1, nrow(patterns))
-    for (col in by) {
-      m     <- patterns[[col]]
-      a     <- a * ifelse(m, mprobs[[col]], 1-mprobs[[col]])
-      b     <- b * ifelse(m, uprobs[[col]], 1-uprobs[[col]])
-    }
-    gm <- p*a / (p*a + (1-p)*b)
-    gu <- p*b / (p*a + (1-p)*b)
+    # estep: log-scale posterior avoids repeated products and underflow
+    logm <- logprob_patterns(mprobs)
+    logu <- logprob_patterns(uprobs)
+    gm <- stats::plogis(stats::qlogis(p) + logm - logu)
+    gu <- 1 - gm
     # mstep
-    p <- sum(patterns$n*gm)/sum(patterns$n)
+    n_gm <- n * gm
+    n_gu <- n * gu
+    sum_n_gm <- sum(n_gm)
+    sum_n_gu <- sum(n_gu)
+    p <- sum(n_gm)/sum(n)
     if (recalculate_p_and_stop) break;
+    mprobs <- as.numeric(colSums(G * n_gm) / sum_n_gm)
+    uprobs <- as.numeric(colSums(G * n_gu) / sum_n_gu)
+    names(mprobs) <- names(uprobs) <- by
     for (col in by) {
-      m             <- patterns[[col]]
-      mprobs[[col]] <- sum(patterns$n*gm*m) / sum(patterns$n*gm)
-      if (mprobs[[col]] > mprob_max) mprobs[[col]] <- mprob_max
-      if (mprobs[[col]] < uprob_min) {
+      if (mprobs[col] > mprob_max) mprobs[col] <- mprob_max
+      if (mprobs[col] < uprob_min) {
         warning("m-probabilities close to 0 occured; probably converged to wrong solution")
-        mprobs[[col]] <- uprob_min
+        mprobs[col] <- uprob_min
       }
-      uprobs[[col]] <- sum(patterns$n*gu*m) / sum(patterns$n*gu)
-      if (uprobs[[col]] < uprob_min) uprobs[[col]] <- uprob_min
-      if (uprobs[[col]] > mprob_max) {
+      if (uprobs[col] < uprob_min) uprobs[col] <- uprob_min
+      if (uprobs[col] > mprob_max) {
         warning("u-probabilities close to 1 occured; probably converged to wrong solution")
-        uprobs[[col]] <- mprob_max
+        uprobs[col] <- mprob_max
       }
     }
     # check convergence
-    eps <- 0
-    for (col in by) {
-      eps <- eps + sum((mprobs[[col]] - mprobs_prev[[col]])^2)
-      if (eps > tol) break
-      eps <- eps + sum((uprobs[[col]] - uprobs_prev[[col]])^2)
-      if (eps > tol) break
-    }
+    eps <- sum((mprobs - mprobs_prev)^2) + sum((uprobs - uprobs_prev)^2)
     if (eps < tol) recalculate_p_and_stop <- TRUE
     mprobs_prev <- mprobs
     uprobs_prev <- uprobs
   }
   for (col in by) {
-    if (any(mprobs[[col]] <= uprobs[[col]])) {
+    if (any(mprobs[col] <= uprobs[col])) {
       warning("m-probabilities for '", col, "' are smaller than or equal to u-probabilities; ", 
         "probably converged to wrong solution")
     }
   }
+  mprobs <- as.list(mprobs)
+  uprobs <- as.list(uprobs)
   structure(list(mprobs=mprobs, uprobs=uprobs, p=p, patterns=patterns), 
     class="problink_em")
 }
